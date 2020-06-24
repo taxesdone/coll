@@ -1,0 +1,92 @@
+#!/bin/ksh
+# Copyright IBM Corporation 2002, 2008 All Rights Reserved.
+#
+usage() {
+   echo ""
+   echo "get_mksysb [-r] [-n] [-m 'machines to get mksysb from']"
+   echo "   "
+   echo "    -r remove oldest mksysb for client machine"
+   echo "    -n no_make - do not make new mksysb after removing oldest"
+   echo "    -m machine_list"
+   echo ""
+   echo "get mksysb from each client machine specified with -m."
+   echo ""
+   echo "-r flag says remove oldest existing mksysb for the machines"
+   echo "   being backed up.  You must specify machine list with -m flag"
+   echo "   when using -r flag."
+   echo ""
+   echo "-n no_make flag with -r to remove a generation of mksysb, without"
+   echo "   creating a new one.  Again, -m flag is required with -r flag."
+   echo ""
+   echo "script assumes client mksysbs should be placed in a directory"
+   echo "/export/mksysb/client.  This will allow mksysb for one client to"
+   echo "be made while other clients are enabled for install, without an" 
+   echo "nfs export conflict"
+   exit 1
+   }
+
+remove_old=
+
+machine_list=
+
+no_make=
+
+while getopts rnh?m: option
+   do
+   case $option in
+   r) remove_old=1;;
+   m) machine_list="$OPTARG";;
+   n) no_make=1;;
+   h) usage;;
+   ?) usage;;
+   esac
+   done
+
+# 3-10-2008, do not run without user specified machine_list
+if [ -z "$machine_list" ]; then
+   usage
+fi
+
+# do not remove mksysb images without a machine_list
+if [ -z "$machine_list" ] && [ ! -z "$remove_old" ]; then
+   usage
+fi
+
+# do not run without some command line arguments
+if [ $# -eq 0 ]; then
+   usage
+fi
+
+# if machine_list is null at this point, set it to ALL clients
+# As of 3-10-2008, won't do this, because we always expect a user
+# specified machine_list
+#if [ -z "$machine_list" ]; then 
+#   machine_list=`lsnim -c machines | grep -v master | awk '{print $1}'`
+#fi
+
+# echo machine list is $machine_list
+cd /export/mksysb2
+for m in $machine_list
+   do
+
+   if [ ! -z "$remove_old" ]; then
+      nim_mksysb_res=$(ls -lt $m  2>>/dev/null | grep $m | tail -1 | awk '{print $9}')
+      if [ ! -z "$nim_mksysb_res" ]; then
+         echo removing old file and nim resource $nim_mksysb_res
+         nim -o remove $nim_mksysb_res
+         rm $m/$nim_mksysb_res
+      fi
+   fi
+#  if no_make is null, go ahead and make the mksysb
+      if [ -z "$no_make" ]; then   
+         if [[ ! -d "/export/mksysb2/$m" ]] then
+            mkdir /export/mksysb2/$m
+         fi 
+      filename="$m"_`date +%Y%m%d%H%M`
+      echo new file / nim resource is $filename
+      echo machine to backup is $m
+      nim -o define -t mksysb -aserver=master -amk_image=yes \
+      -alocation=/export/mksysb2/$m/$filename \
+      -asource=$m $filename
+      fi
+   done
