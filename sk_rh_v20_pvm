@@ -1,0 +1,469 @@
+#!/bin/bash
+# sk_rh_v20_pvm V2.0 20180103
+# Copyright IBM Corporation 2015, 2016, 2017, 2018.  All rights reserved.
+#
+# sk_rh_v20_pvm
+#
+# This script is intended to 1) convert a RH minimal software install
+# into an install server (-s setup flag) and 2) enable client installs
+# (with several other flags)
+#
+
+usage() {
+if grep -i KVM /etc/os-release >/dev/null;
+then
+  echo "This script is to be run on a RHEL instance, and not PowerKVM"
+  chmod ugo-x sk_rh_v20_pvm
+  exit 1
+fi
+echo "Usage:"
+echo ""
+echo "For server setup, use -s flag.  If selinux is not permissive,"
+echo "you will be prompted to take reboot"
+echo "sk_rh_v20_pvm -s -v <simple version name, e.g. RH76LE>"
+echo ""
+echo "After setup, to enable a client for install"
+echo "sk_rh_v20_pvm   -H <hmc ip> -u <hmc user> \\"
+echo "                -m <managed server> \\"
+echo "                -c <client hostname> \\ (must resolve to IP)"
+echo "                -p <partition name> \\"
+echo "                -f <profile name> \\"
+echo "                -d <targetdisk> (e.g. sda for single path, mpatha for multipath)"
+echo ""
+echo "Enable asssumes client LPAR is powered off, and"
+echo "the LPAR console is not open.  The client LPAR"
+echo "will be activated to read Ethernet MAC address"
+echo "by HMC lpar_netboot command."
+exit 1
+     }
+
+# you should only have to run with -s for setup once
+sk_setup() {
+
+if grep -i KVM /etc/os-release >/dev/null;
+then
+  echo "This script is to be run on a RHEL instance, and not PowerKVM"
+  chmod ugo-x sk_rh_v20_pvm
+  exit 1
+fi
+
+# now getting version on the command line, with -s for setup.  Not here...
+# get version here...
+#VERSION=
+#echo -n "Enter a simple name for the version, e.g. RH74LE, or ALTRH74LE: "; read VERSION;
+# if VERSION is null, usage and exit
+if [[ -z $VERSION ]]  ; then
+   usage;
+   exit
+fi
+
+if [[ ! -d /var/www/html/$VERSION ]] ; then
+   echo "making /var/www/html/$VERSION"
+   mkdir -p /var/www/html/$VERSION ;
+   fi
+
+chmod ugo+rx /var/www/html/$VERSION
+ 
+if [[ ! -d /var/www/html/kickstart ]] ; then
+   echo "making /var/www/html/kickstart"
+   mkdir -p /var/www/html/kickstart ;
+   fi
+ 
+chmod ugo+rx /var/www/html/kickstart
+
+# re-write $VERSION in /etc/fstab - sometimes it is edited in, and wrong
+# Some history here, in 2014 SLES 11 HAD to be in /dev/sr0, so for our lab
+# RHEL iso media was always mounted in the 2nd virtual optical, /dev/sr1
+# We mount the media here, just to add rpms to the install server.  We
+# likely will NOT nfs export this, if clients install by http
+# Why install clients by http? Far fewer ports required than NFS requires.
+# 2016-01-15, I WILL keep it on /dev/sr0 for an RHEL install server
+
+cp /etc/fstab /etc/fstab.original
+cat /etc/fstab.original | grep -v RH > /etc/fstab
+echo "/dev/sr0 /var/www/html/$VERSION iso9660 defaults" >>/etc/fstab
+mount /var/www/html/$VERSION
+
+# Re-write install server's $VERSION.repo file
+# Put this in, to add a few rpms to the server itself
+   rm /etc/yum.repos.d/$VERSION.repo
+   echo "creating $VERSION.repo"
+   echo "[$VERSION]" >>/etc/yum.repos.d/$VERSION.repo
+   echo "name=The_$VERSION" >>/etc/yum.repos.d/$VERSION.repo
+   echo "baseurl=file:///var/www/html/$VERSION" >>/etc/yum.repos.d/$VERSION.repo
+   echo "enabled=1" >>/etc/yum.repos.d/$VERSION.repo
+   echo "gpgcheck=0" >>/etc/yum.repos.d/$VERSION.repo
+#   yum repolist enabled
+
+# If your clients install by http, no need for
+# rpcbind or nfs-utils, but you will need it if you
+# install clients by NFS
+# yum -y install rpcbind.ppc64le
+# yum -y install nfs-utils
+yum -y install net-tools
+yum -y install bind-utils
+yum -y install tftp-server
+yum -y install dhcp.ppc64le
+yum -y install xinetd.ppc64le
+yum -y install httpd.ppc64le
+yum -y install wget.ppc64le
+yum -y install createrepo
+
+# We want the ibm-power-repo, and the rhel73_v13_template_ks.cfg
+# in /var/www/html/kickstart on the install server.
+#
+# 20170405 for RHEL73LE, want to look for template file
+# in the current directory, as if untarred with this script
+# Likewise, also the ibm-power-repo-latest.noarch.rpm
+#
+# The tar file will contain 
+# 1) this script sk_rh_v20_pvm
+# 2) template-v13-73LE-ks.cfg
+# 2.5) an additional, no-mongo template 20171013
+# 3) ibm-power-repo-latest.noarch.rpm
+# 4) ibm-power-repo-expect (to run /opt/ibm/lop/configure and accept y)
+# 5) /var/www/html/local_performance for Nasypany performance lab
+# 
+
+if ! cp -p /root/ibm-power-repo-latest.noarch.rpm /var/www/html/kickstart ; then
+echo "find ibm-power-repo-latest.noarch.rpm and put it in /var/www/html/kickstart"
+fi
+
+# copy icp-docker-17.12.1 to /var/www/html/kickstart for client installs
+if ! cp -p /root/icp-docker-17.12.1_ppc64le.bin /var/www/html/kickstart ; then
+echo "find icp-docker-17.12.1_ppc64le.bin and put it in /var/www/html/kickstart"
+fi
+
+# 20180104, parse all "./raw-" kickstart template files,
+# fill in VERSION, and output them into /var/www/html/kickstart
+# with raw- stripped off 
+# These are still ks template files.  More fields are replaced
+# when each individual client is enabled for install
+for rawf in $(ls /root/raw-*ks.cfg)
+do
+f=$(echo $rawf | cut -d- -f2-)
+cat $rawf  | sed s/\<VERSION\>/$VERSION/g >/var/www/html/kickstart/$f
+done
+
+if ! cp -p /root/ibm-power-repo-expect /var/www/html/kickstart ; then
+echo "find ibm-power-repo-expect and put it in /var/www/html/kickstart"
+fi
+
+if ! createrepo /var/www/html/local_performance ; then
+echo "missing the /var/www/html/local_performance"
+fi
+
+# go to dhcp server directory, save dhcpd.conf,
+# write a new one based on install server config.
+cd /etc/dhcp
+mv /etc/dhcp/dhcpd.conf /etc/dhcp/dhcpd.conf.$(date +%y%m%d%H%M%S)
+
+cat << _EOF_ >>dhcpd.conf
+#
+# DHCP Server Configuration file.  Written by sk_cent72LE script
+#   see /usr/share/doc/dhcp*/dhcpd.conf.sample
+#   see man 5 dhcpd.conf
+#
+# Do not use a range in this file.  We are not trying to give
+# out dynamic addresses. DHCP used here only to match specific
+# MAC addresses to specific IP addrs, and to respond to bootp requests
+# We are not taking over DHCP service for the enterprise.
+#
+default-lease-time 600;
+max-lease-time 7200;
+# see /etc/rsyslog.conf for local7 log direct
+log-facility local7;
+#
+_EOF_
+
+DOMAIN=
+DOMAIN=$(grep search /etc/resolv.conf | head -1 | awk '{print $2}')
+if [ ! -z $DOMAIN ] ; then
+   echo "option domain-name \"$DOMAIN\";" >>dhcpd.conf
+fi
+
+DNSSERVER=
+DNSSERVER=$(grep nameserver /etc/resolv.conf | head -1 | awk '{print $2}')
+if [ ! -z $DNSSERVER ] ; then
+   echo "option domain-name-servers $DNSSERVER;" >>dhcpd.conf
+fi
+echo "#" >>dhcpd.conf
+
+# This is a simple, single subnet attachment for now
+ADDPREF=
+ADDPREF=$(ip addr | grep inet | grep brd | head -1 | awk '{print $2}')
+NETWORK=$(ipcalc -n $ADDPREF | awk -F"=" '{print $2}')
+NETMASK=$(ipcalc -m $ADDPREF | awk -F"=" '{print $2}')
+GATEWAY=$(ip route | grep default | head -1 | awk '{print $3}')
+
+echo "subnet $NETWORK netmask $NETMASK {" >>dhcpd.conf
+echo "  option routers $GATEWAY;" >>dhcpd.conf
+echo "}" >>dhcpd.conf
+echo "#" >>dhcpd.conf
+
+systemctl enable httpd.service
+systemctl start httpd.service
+systemctl enable dhcpd.service
+systemctl start dhcpd.service
+
+# Per Red Hat https://access.redhat.com/documentation/en-US/Red_Hat_Enterprise_Linux/7/html/Installation_Guide/chap-installation-server-setup.html#sect-network-boot-setup-ppc-grub2 
+
+# Perhaps these are sufficient, and I will not have to shut off firewall
+firewall-cmd --permanent --add-service=tftp
+firewall-cmd --permanent --add-service=http
+firewall-cmd --add-service=tftp
+firewall-cmd --add-service=http
+
+# systemctl stop firewalld.service
+# systemctl disable firewalld.service
+
+# turn off disable of tftp in xinetd
+cd /etc/xinetd.d
+# save tftp files, use the latest one to (-ltr) for disable=no
+mv tftp tftp.original.$(date +%y%m%d%H%M%S)
+cat $(ls -ltr tftp.original* | tail -1 | awk '{print $9}') | grep -v disable | grep -v } > tftp
+echo "disable = no" >> tftp
+echo "}" >> tftp
+cat tftp
+systemctl restart xinetd.service
+
+# RHEL7 provides grub2-mknetdir to configure /var/lib/tftpboot, place grub2
+# directory, and the core.elf boot image.  Some references suggest grub.cfg
+# be written to /var/lib/tftpboot/boot/grub2 directory, but I have had
+# good luck placing grub.cfg into the same directory where I found core.elf
+# /var/lib/tftpboot/boot/grub2/powerpc-ieee1275
+#
+# grub2-mknetdir populates the --net-directory with version specific
+# code, and it makes me think you will need a network boot server
+# for each version of RH you wish to install.
+# The http server for repository, and for kickstart files, 
+# could be anything.  I have been using RH65 for a few years.
+# This script sets up the instance you are on, as boot server 
+# and http server.
+
+grub2-mknetdir --net-directory=/var/lib/tftpboot
+
+# place the kernel boot image, and initrd.img in the tftp path
+mkdir -p /var/lib/tftpboot/ppc/ppc64
+cp -p /var/www/html/$VERSION/ppc/ppc64/vmlinuz /var/lib/tftpboot/ppc/ppc64 
+cp -p /var/www/html/$VERSION/ppc/ppc64/initrd.img /var/lib/tftpboot/ppc/ppc64 
+
+# set longer timeout for grub menu in /etc/grub.d/40_custom
+if ! grep "set timeout=" /etc/grub.d/40_custom >/dev/null;
+then
+echo "set timeout=120" >> /etc/grub.d/40_custom
+fi
+
+systemctl enable httpd.service
+systemctl start httpd.service
+systemctl enable dhcpd.service
+systemctl start dhcpd.service
+systemctl enable xinetd.service
+systemctl restart xinetd.service
+wait ;
+
+# disable selinux for reboot
+# 20160613 only if not already disabled. Save a reboot
+
+cd /etc/selinux
+if ! grep SELINUX=permissive config; then
+   rm -f config.original*
+   cp config config.original.$(date +%y%m%d%H%M%S)
+   cat config.original* | sed s/SELINUX=enforcing/SELINUX=permissive/g \
+                     > config
+
+# 20160128 Will test here if I truly need reboot after changing SELINUX config
+   echo -n "Setup complete.  Reboot required.  Reboot now? (y/n)"; read yn; 
+   if [[ $yn = "y" ]] || [[ $yn = "Y" ]]; then
+            shutdown -r now
+   fi
+fi
+}
+# end of sk_setup
+
+# wipe removes all client definitions.  Use it in front of sk_setup
+# to clean the config.
+# 20151102, I haven't decided what I want here for
+# RHEL71.  Linux definitely lacks grep -p (paragraph)
+
+#wipe()
+#{
+#for f in $(ls /var/lib/tftpboot/etc/01-*)
+#do
+#unlink $f
+#done
+#mv /var/lib/tftpboot/etc/yaboot.conf /var/lib/tftpboot/etc/yaboot.conf.$(date +%y%m%d%H%M%S)
+#rm /export/kickstart/ks_s[0-9][0-9].cfg
+#mv /etc/dhcp/dhcpd.conf /etc/dhcp/dhcpd.conf.$(date +%y%m%d%H%M%S)
+#}
+# end wipe()
+
+hmc=
+hmc_user=
+client_hostname=
+client_ip=
+server_ip=
+managed_server=
+partition=
+profile=
+TEMPLATE=
+
+
+while getopts H:u:c:m:p:f:d:t:v:shw option
+do
+case $option in
+H) hmc="$OPTARG";;
+u) hmc_user="$OPTARG";;
+c) client_hostname="$OPTARG";;
+m) managed_server="$OPTARG";;
+p) partition="$OPTARG";;
+f) profile="$OPTARG";;
+d) TARGETDISK="$OPTARG";;
+t) TEMPLATE="$OPTARG";;
+v) VERSION="$OPTARG";;
+s) sk_setup;;
+h) usage;;
+w) wipe; sk_setup;;
+esac
+done
+
+if grep -i KVM /etc/os-release >/dev/null;
+then
+  echo "This script is to be run on a RHEL instance, and not PowerKVM"
+  chmod ugo-x sk_rh_v20_pvm
+  exit 1
+fi
+
+# if no command line arguments, usage()
+if [[ $# -eq 0 ]]; then
+   usage
+fi
+ 
+# if any one of these is null, usage and exit, else continue
+if [[ -z $hmc ]] || [[ -z $hmc_user ]] || [[ -z $managed_server ]] || [[ -z $partition ]] || [[ -z $profile ]] || [[ -z $TARGETDISK ]] ; then
+   usage;
+   exit
+
+else
+   host $client_hostname >> /dev/null 2>&1 ;
+   if [[ $? != 0 ]] ; then
+   echo "cannot resolve client hostname $client_hostname"
+   exit 1;
+   fi
+
+# if TEMPLATE is null, set it to the default
+if [[ -z $TEMPLATE ]] ; then
+   TEMPLATE=template-v13-73LE-ks.cfg ;
+fi
+
+
+#  set some variables
+   client_ip=$(host $client_hostname | awk '{print $4}')
+   server_ip=$(ifconfig eth0 | grep "inet " | awk '{print $2}')
+
+#  If client partition is already running, error and exit
+echo "check if $partition is already running..."
+echo "enter $hmc_user password at HMC $hmc"
+   ssh $hmc_user@$hmc lssyscfg -m $managed_server -r lpar --filter lpar_names=$partition -F name,state >/tmp/onemac
+   wait ;
+   if [[ ! -z $(grep Running /tmp/onemac) ]] ; then
+   echo "$partition is already running. Shut it down and retry command."
+   rm /tmp/onemac
+   exit 1;
+   fi
+
+#  run lpar_netboot on HMC to read client partition MAC address
+#  Client partition MAC address will be used in client /etc/dhcp/dhcpd.conf stanza
+
+   echo "running lpar_netboot at HMC $hmc for MAC address of $partition..."
+   echo "enter $hmc_user password at HMC $hmc"
+   ssh $hmc_user@$hmc lpar_netboot -M -n -t ent $partition $profile $managed_server >/tmp/onemac 2>&1
+   wait ;
+
+if [[ ! -z $(grep "cannot connect" /tmp/onemac) ]] ; then
+   cat /tmp/onemac ;
+   rm /tmp/onemac ;
+   echo "close the vterm console on $partition and retry command" ;
+   exit 1 ;
+   fi
+   
+if [[ ! -z $(grep "exited abnormally" /tmp/onemac) ]] ; then
+   cat /tmp/onemac ;
+   rm /tmp/onemac ;
+   echo "check managed server name  and retry command" ;
+   exit 1 ;
+   fi
+
+   mac=$(cat /tmp/onemac | tail -1 | awk '{print $3}')
+   cutmac[0]=$(echo $mac | cut -c1-2)
+   cutmac[1]=$(echo $mac | cut -c3-4)
+   cutmac[2]=$(echo $mac | cut -c5-6)
+   cutmac[3]=$(echo $mac | cut -c7-8)
+   cutmac[4]=$(echo $mac | cut -c9-10)
+   cutmac[5]=$(echo $mac | cut -c11-12)
+   rm /tmp/onemac
+
+# echo out client menuentry stanza to /etc/grub.d/40_custom
+# in the linux kernel specify below, you could include an inst.repo.
+# But since we are pointing the inst.repo in the kickstart file,
+# there is no need to point to it twice
+
+cd /etc/grub.d
+if [[ ! $(grep $partition /etc/grub.d/40_custom) ]] ; then
+echo "" >>40_custom
+echo "menuentry '$partition RHEL LE Network Install' --class fedora --class gnu_linux --class gnu --class os {" >> 40_custom
+echo "        linux /ppc/ppc64/vmlinuz ro inst.text inst.ks=http://$server_ip/kickstart/$partition-ks.cfg" >>40_custom
+echo "        initrd /ppc/ppc64/initrd.img" >>40_custom
+echo "}" >>40_custom
+grub2-mkconfig -o /var/lib/tftpboot/boot/grub2/powerpc-ieee1275/grub.cfg
+
+else
+echo "Partition $partition already listed in 40_custom. exiting."
+exit 1;
+fi
+
+# echo out the stanza to /etc/dhcp/dhcpd.conf
+cd /etc/dhcp
+if [[ ! -z $(grep $client_hostname /etc/dhcp/dhcpd.conf) ]] ; then
+   echo "$client_hostname already in /etc/dhcp/dhcpd.conf. exiting."
+   exit 1;
+else
+echo "" >>dhcpd.conf
+echo "host $client_hostname {" >>dhcpd.conf
+echo "  hardware ethernet ${cutmac[0]}:${cutmac[1]}:${cutmac[2]}:${cutmac[3]}:${cutmac[4]}:${cutmac[5]};" >>dhcpd.conf
+echo "  fixed-address $client_ip;" >>dhcpd.conf
+echo "  filename \"/boot/grub2/powerpc-ieee1275/core.elf\";" >> dhcpd.conf
+echo "  server-name \"$server_ip\";" >>dhcpd.conf
+echo "  }" >>dhcpd.conf
+systemctl restart dhcpd
+fi
+
+# parse the kickstart template to client-ks.cfg
+DOMAIN=
+DOMAIN=$(grep search /etc/resolv.conf | head -1 | awk '{print$2}')
+
+DNSSERVER=
+DNSSERVER=$(grep nameserver /etc/resolv.conf | head -1 | awk '{print $2}')
+
+# This is a simple, single subnet attachment for now
+ADDPREF=
+ADDPREF=$(ip addr | grep inet | grep brd | head -1 | awk '{print $2}')
+NETMASK=$(ipcalc -m $ADDPREF | awk -F"=" '{print $2}')
+GATEWAY=$(ip route | grep default | head -1 | awk '{print $3}')
+
+cd /var/www/html/kickstart
+cat /var/www/html/kickstart/$TEMPLATE     | sed s/\<installserverip\>/$server_ip/g \
+                                          | sed s/\<yourclientip\>/$client_ip/g \
+      | sed s/\<netmask\>/$NETMASK/g \
+      | sed s/\<gateway\>/$GATEWAY/g \
+      | sed s/\<dnsserver\>/$DNSSERVER/g \
+      | sed s/\<targetdisk\>/$TARGETDISK/g \
+      | sed s/\<yourclienthostname\>/$client_hostname.$DOMAIN/g > /var/www/html/kickstart/$partition-ks.cfg
+
+chmod ugo+rx /var/www/html/kickstart/$partition-ks.cfg
+# should not have to restart httpd, but it has been flaky.
+wait;
+systemctl restart httpd
+
+
+fi
